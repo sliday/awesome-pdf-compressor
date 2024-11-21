@@ -4,10 +4,11 @@ Aggressive PDF compression with thumbnail generation, metadata extraction, and m
 
 ## Features
 - Multi-tool PDF compression (Ghostscript, qpdf, mutool)
-- 200x400px thumbnail generation (pdftocairo)
+- 200px thumbnail generation (pdftocairo)
 - Metadata preservation and extraction
 - Parallel processing with batch support
 - Keeps original if compressed version is larger
+- Organized output directory structure
 
 ## Prerequisites
 ```bash
@@ -49,27 +50,32 @@ node pdf-compressor.js input.pdf --no-pages --no-thumbnails --no-metadata
 
 ### Output Structure
 ```
-./
-├── compressed_output.pdf         # [Unless --no-merge]
-└── compressed_pages/            
-    ├── page_00001.pdf           # [Unless --no-pages]
-    ├── page_00001_thumb.jpg     # [Unless --no-thumbnails]
-    ├── original_pdf_metadata.txt # [Unless --no-metadata]
-    └── compressed_pdf_metadata.txt
+./out/
+├── pages/                      # [Unless --no-pages]
+│   ├── page_00001.pdf
+│   ├── page_00002.pdf
+│   └── ...
+├── thumbnails/                 # [Unless --no-thumbnails]
+│   ├── page_00001_thumb.jpg
+│   ├── page_00002_thumb.jpg
+│   └── ...
+├── original_pdf_metadata.txt   # [Unless --no-metadata]
+├── compressed_pdf_metadata.txt # [Unless --no-metadata]
+└── originalname_compressed.pdf # [Unless --no-merge]
 ```
 
 ## Configuration
 ```javascript
 const CONCURRENT_TASKS = 2;    // Parallel processes
 const BATCH_SIZE = 100;        // Pages per batch
-const THUMBNAIL_WIDTH = 200;   // Thumbnail dimensions
-const THUMBNAIL_HEIGHT = 400;
+const THUMBNAIL_WIDTH = 200;   // Thumbnail width in pixels
 ```
 
 ## Memory Tips
 - Use `--no-merge` for large PDFs
 - Use `--no-thumbnails` for faster processing
 - Adjust `BATCH_SIZE` for memory optimization
+- All output files are organized in the `out` directory
 
 ## Dependencies
 - pdf-lib: ^1.17.1
