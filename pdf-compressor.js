@@ -1,52 +1,95 @@
 const { spawn } = require('child_process');
 const { execSync } = require('child_process');
-const fs = require('fs').promises;
+const fs = require('fs/promises');
 const path = require('path');
 const { PDFDocument } = require('pdf-lib');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const chalk = require('chalk');
+const { statSync } = require('fs');
 
-// Constants
-const CONCURRENT_TASKS = 2;
-const BATCH_SIZE = 100;
+// Configuration constants
 const THUMBNAIL_WIDTH = 200;
 
-const DEFAULT_OPTIONS = {
-    createMerged: true,
-    keepPages: true,
-    createMetadata: true,
-    createThumbnails: true
-};
+async function generateThumbnail(pdfPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            '-jpeg',
+            '-f', '1',
+            '-l', '1',
+            '-scale-to', THUMBNAIL_WIDTH.toString(),
+            pdfPath,
+            outputPath
+        ];
+        
+        const pdftocairo = spawn('pdftocairo', args);
+        let stderr = '';
+        
+        pdftocairo.stderr.on('data', (data) => {
+            stderr += data.toString();
+        });
 
-// Helper function to format bytes
+        pdftocairo.on('error', (error) => {
+            reject(new Error(`pdftocairo failed: ${error.message}`));
+        });
+
+        pdftocairo.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`pdftocairo failed with code ${code}: ${stderr}`));
+        });
+    });
+}
+
+async function extractMetadata(pdfPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const pdfinfo = spawn('pdfinfo', [pdfPath]);
+        let stdout = '';
+        let stderr = '';
+        
+        pdfinfo.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+        
+        pdfinfo.stderr.on('data', (data) => {
+            stderr += data.toString();
+        });
+
+        pdfinfo.on('error', (error) => {
+            reject(new Error(`pdfinfo failed: ${error.message}`));
+        });
+
+        pdfinfo.on('close', async (code) => {
+            if (code === 0) {
+                await fs.writeFile(outputPath, stdout);
+                resolve();
+            } else {
+                reject(new Error(`pdfinfo failed with code ${code}: ${stderr}`));
+            }
+        });
+    });
+}
+
+// Helper functions
 function formatBytes(bytes) {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
+    const dm = 2;
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    const size = parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    return size.padStart(8);
 }
 
-// Helper function to format time
-function formatTime(seconds) {
-    if (seconds < 60) return `${ seconds.toFixed(1) } s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = (seconds % 60).toFixed(1);
-    return `${ minutes }m ${ remainingSeconds } s`;
-}
-
-// Check if required executables are available
 function checkExecutable(command) {
     try {
-        execSync(`which ${ command } `);
-    } catch (error) {
-        console.error(`Error: ${ command } is not installed or not in the system PATH.`);
-        process.exit(1);
+        execSync(`which ${command}`);
+        return true;
+    } catch {
+        console.error(chalk.red(`Error: ${command} is not installed or not in PATH`));
+        return false;
     }
 }
 
-// Function to ensure directory exists
 async function ensureDir(dir) {
     try {
         await fs.access(dir);
@@ -55,90 +98,7 @@ async function ensureDir(dir) {
     }
 }
 
-// Function to process batches of pages
-async function processBatch(startPage, endPage, pdfDoc, tempDir, outputDir, options) {
-    const promises = [];
-    const batchStats = {
-        totalOriginalSize: 0,
-        totalCompressedSize: 0,
-        bestToolCounts: { gs: 0, qpdf: 0, mutool: 0, original: 0 }
-    };
-
-    for (let i = startPage; i <= endPage && i <= pdfDoc.getPageCount(); i++) {
-        const pageNum = i;
-        process.stdout.write(chalk.gray(`\r⚡ Processing page ${chalk.white(pageNum)}/${endPage}...`));
-        
-        const tempPdfDoc = await PDFDocument.create();
-        const [page] = await tempPdfDoc.copyPages(pdfDoc, [pageNum - 1]);
-        tempPdfDoc.addPage(page);
-
-        const tempPath = path.join(tempDir, `page_${ String(pageNum).padStart(5, '0') }.pdf`);
-        const outputPath = path.join(outputDir, `page_${ String(pageNum).padStart(5, '0') }.pdf`);
-
-        const pdfBytes = await tempPdfDoc.save();
-        await fs.writeFile(tempPath, pdfBytes);
-
-        promises.push(
-            compressPage(tempPath, outputPath, pageNum)
-                .then(result => {
-                    batchStats.totalOriginalSize += result.originalSize;
-                    batchStats.totalCompressedSize += result.size;
-                    batchStats.bestToolCounts[result.compressionStats.bestTool]++;
-                    return result;
-                })
-        );
-
-        if (promises.length >= CONCURRENT_TASKS) {
-            await Promise.all(promises);
-            promises.length = 0;
-        }
-    }
-
-    if (promises.length > 0) {
-        await Promise.all(promises);
-    }
-
-    // Log batch compression statistics
-    console.log(chalk.cyan('\n📊 Batch Compression Statistics'));
-    console.log('━'.repeat(50));
-    console.log(`📥 Original size:     ${chalk.yellow(formatBytes(batchStats.totalOriginalSize))}`);
-    console.log(`📤 Compressed size:   ${chalk.green(formatBytes(batchStats.totalCompressedSize))}`);
-    console.log(`📉 Compression ratio: ${chalk.magenta(((1 - batchStats.totalCompressedSize / batchStats.totalOriginalSize) * 100).toFixed(1))}%`);
-    
-    console.log(chalk.cyan('\n🔧 Best compression by tool'));
-    console.log('━'.repeat(50));
-    Object.entries(batchStats.bestToolCounts)
-        .filter(([_, count]) => count > 0)
-        .forEach(([tool, count]) => {
-            const emoji = {
-                gs: '🚀',
-                qpdf: '⚡',
-                mutool: '🔨',
-                original: '📄'
-            }[tool] || '•';
-            console.log(`${emoji} ${chalk.yellow(tool.padEnd(8))}: ${chalk.green(count)} pages`);
-        });
-
-    // Batch summary - simplified and more visual
-    console.log(chalk.bold.blue('\n📦 Batch Summary'));
-    console.log(chalk.gray('─'.repeat(50)));
-    const savings = ((1 - batchStats.totalCompressedSize / batchStats.totalOriginalSize) * 100).toFixed(1);
-    console.log(`${chalk.gray(formatBytes(batchStats.totalOriginalSize))} → ${chalk.green(formatBytes(batchStats.totalCompressedSize))} ${chalk.magenta(`(-${savings}%)`)}\n`);
-
-    return batchStats;
-}
-
-// Function to compress a single page
-async function compressPage(inputPath, outputPath, pageNum) {
-    try {
-        await fs.access(inputPath);
-    } catch {
-        throw new Error(`Input file not found: ${inputPath}`);
-    }
-
-    const originalStats = await fs.stat(inputPath);
-    const originalSize = originalStats.size;
-    
+async function compressWithGs(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
         const gsArgs = [
             '-sDEVICE=pdfwrite',
@@ -148,16 +108,16 @@ async function compressPage(inputPath, outputPath, pageNum) {
             '-dQUIET',
             
             // Extreme compression settings
-            '-dPDFSETTINGS=/screen',
+            '-dPDFSETTINGS=/ebook',
             '-dCompatibilityLevel=1.4',
             
             // Aggressive image downsampling
             '-dDownsampleColorImages=true',
             '-dDownsampleGrayImages=true',
             '-dDownsampleMonoImages=true',
-            '-dColorImageResolution=96',
-            '-dGrayImageResolution=96',
-            '-dMonoImageResolution=96',
+            '-dColorImageResolution=112',
+            '-dGrayImageResolution=112',
+            '-dMonoImageResolution=112',
             
             // Maximum image compression
             '-dAutoFilterColorImages=true',
@@ -245,487 +205,312 @@ async function compressPage(inputPath, outputPath, pageNum) {
             '-dCompressPages=true',
             '-dUseFlateCompression=true',
             '-dDetectDuplicateImages=true',
+            
             `-sOutputFile=${outputPath}`,
             inputPath
         ];
 
-        const gsProcess = spawn('gs', gsArgs);
-
+        const gs = spawn('gs', gsArgs);
         let stderr = '';
-        gsProcess.stderr.on('data', (data) => {
+        
+        gs.stderr.on('data', (data) => {
             stderr += data.toString();
         });
 
-        gsProcess.on('error', (error) => {
-            reject(new Error(`Failed to start Ghostscript process: ${error.message}`));
+        gs.on('error', (error) => {
+            reject(new Error(`GS failed: ${error.message}`));
         });
 
-        gsProcess.on('close', async (code) => {
-            if (code === 0) {
-                try {
-                    // Track sizes after each step
-                    const gsStats = await fs.stat(outputPath);
-                    const gsSize = gsStats.size;
-
-                    // QPDF optimization
-                    await optimizeWithQpdf(outputPath, outputPath);
-                    const qpdfStats = await fs.stat(outputPath);
-                    const qpdfSize = qpdfStats.size;
-
-                    // MuTool optimization
-                    await optimizeWithMutool(outputPath, outputPath);
-                    const mutoolStats = await fs.stat(outputPath);
-                    const mutoolSize = mutoolStats.size;
-
-                    // Determine which tool provided the best compression
-                    const compressionResults = [
-                        { tool: 'gs', size: gsSize },
-                        { tool: 'qpdf', size: qpdfSize },
-                        { tool: 'mutool', size: mutoolSize }
-                    ];
-                    
-                    const bestResult = compressionResults.reduce((best, current) => 
-                        current.size < best.size ? current : best
-                    );
-
-                    if (bestResult.size >= originalSize) {
-                        // If no compression method was better, use original
-                        await fs.copyFile(inputPath, outputPath);
-                        resolve({
-                            size: originalSize,
-                            originalSize,
-                            usedOriginal: true,
-                            compressionStats: {
-                                gs: gsSize,
-                                qpdf: qpdfSize,
-                                mutool: mutoolSize,
-                                bestTool: 'original'
-                            }
-                        });
-                    } else {
-                        // Generate thumbnail after successful compression
-                        const thumbnailPath = outputPath.replace('.pdf', '_thumb.jpg');
-                        await generateThumbnail(outputPath, thumbnailPath);
-
-                        resolve({
-                            size: bestResult.size,
-                            originalSize,
-                            usedOriginal: false,
-                            thumbnailPath,
-                            compressionStats: {
-                                gs: gsSize,
-                                qpdf: qpdfSize,
-                                mutool: mutoolSize,
-                                bestTool: bestResult.tool
-                            }
-                        });
-                    }
-                } catch (err) {
-                    reject(new Error(`Processing failed: ${err.message}`));
-                }
-            } else {
-                reject(new Error(`Ghostscript failed with code ${code}: ${stderr}`));
-            }
+        gs.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`GS failed with code ${code}: ${stderr}`));
         });
     });
 }
 
-// Function to optimize PDF using qpdf
-async function optimizeWithQpdf(inputFile, outputFile) {
-    const tempFile = `${outputFile}.tmp`;
+async function compressWithMutool(inputPath, outputPath) {
     return new Promise((resolve, reject) => {
-        const qpdfProcess = spawn('qpdf', [
-            '--linearize',
-            '--optimize-images',
-            '--compression-level=9',
-            inputFile,
-            tempFile
-        ]);
-
+        const args = [
+            'clean',
+            '-gggg',
+            '-z',
+            '-f',
+            '-i',
+            '-c',
+            '-s',
+            '-t',
+            '-Z',
+            '-e', '100',
+            '--color-image-subsample-method', 'bicubic',
+            '--gray-image-subsample-method', 'bicubic',
+            '--color-image-subsample-dpi', '112,112',
+            '--gray-image-subsample-dpi', '112,112',
+            '--color-image-recompress-method', 'jpeg:50',
+            '--gray-image-recompress-method', 'jpeg:50',
+            inputPath,
+            outputPath
+        ];
+        
+        const mutool = spawn('mutool', args);
         let stderr = '';
-        qpdfProcess.stderr.on('data', (data) => {
+        let stdout = '';
+        
+        mutool.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+        
+        mutool.stderr.on('data', (data) => {
             stderr += data.toString();
         });
 
-        qpdfProcess.on('error', (error) => {
-            reject(new Error(`Failed to start qpdf process: ${error.message}`));
+        mutool.on('error', (error) => {
+            reject(new Error(`MuTool failed: ${error.message}`));
         });
 
-        qpdfProcess.on('close', async (code) => {
-            if (code === 0) {
-                try {
-                    await fs.rename(tempFile, outputFile);
-                    resolve();
-                } catch (err) {
-                    reject(new Error(`Failed to rename temporary file: ${err.message}`));
-                }
-            } else {
-                // Clean up temp file if it exists
-                try {
-                    await fs.unlink(tempFile);
-                } catch (err) {
-                    // Ignore error if temp file doesn't exist
-                }
-                reject(new Error(`qpdf failed: ${stderr}`));
-            }
-        });
-    });
-}
-
-// Function to optimize PDF using mutool
-async function optimizeWithMutool(inputFile, outputFile) {
-    const tempFile = `${outputFile}.tmp`;
-    return new Promise((resolve, reject) => {
-        const args = ['clean', '-gggg', inputFile, tempFile];
-        const mutoolProcess = spawn('mutool', args);
-
-        let stderr = '';
-        mutoolProcess.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-
-        mutoolProcess.on('error', (error) => {
-            reject(new Error(`Failed to start mutool process: ${error.message}`));
-        });
-
-        mutoolProcess.on('close', async (code) => {
-            if (code === 0) {
-                try {
-                    await fs.rename(tempFile, outputFile);
-                    resolve();
-                } catch (err) {
-                    reject(new Error(`Failed to rename temporary file: ${err.message}`));
-                }
-            } else {
-                // Clean up temp file if it exists
-                try {
-                    await fs.unlink(tempFile);
-                } catch (err) {
-                    // Ignore error if temp file doesn't exist
-                }
-                reject(new Error(`mutool failed: ${stderr}`));
-            }
-        });
-    });
-}
-
-// Function to merge PDF pages
-async function mergePDFs(inputDir, outputFile, originalInputFile) {
-    const mergedPdf = await PDFDocument.create();
-    
-    // Get all PDF files in the directory
-    const files = await fs.readdir(inputDir);
-    const pdfFiles = files
-        .filter(file => file.endsWith('.pdf'))
-        .sort((a, b) => {
-            const numA = parseInt(a.match(/\d+/)[0]);
-            const numB = parseInt(b.match(/\d+/)[0]);
-            return numA - numB;
-        });
-
-    // Merge each PDF file
-    for (const file of pdfFiles) {
-        const pdfBytes = await fs.readFile(path.join(inputDir, file));
-        const pdf = await PDFDocument.load(pdfBytes);
-        const pages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
-        pages.forEach(page => mergedPdf.addPage(page));
-    }
-
-    const mergedPdfBytes = await mergedPdf.save({
-        useObjectStreams: true,
-        addDefaultPage: false,
-        objectsStack: 50,
-        compress: true
-    });
-
-    // Compare with original file size
-    const originalStats = await fs.stat(originalInputFile);
-    const originalSize = originalStats.size;
-    
-    if (mergedPdfBytes.length < originalSize) {
-        await fs.writeFile(outputFile, mergedPdfBytes);
-    } else {
-        // If merged file is larger, use the original
-        await fs.copyFile(originalInputFile, outputFile);
-        console.log('Warning: Compressed version was larger than original. Using original file.');
-    }
-}
-
-// Function to generate thumbnail
-async function generateThumbnail(pdfPath, thumbnailPath) {
-    const thumbnailsDir = path.join(__dirname, 'out', 'thumbnails');
-    const newThumbnailPath = path.join(thumbnailsDir, path.basename(thumbnailPath));
-
-    return new Promise((resolve, reject) => {
-        const pdftocairoProcess = spawn('pdftocairo', [
-            '-jpeg',
-            '-scale-to', THUMBNAIL_WIDTH.toString(),
-            '-f', '1',
-            '-l', '1',
-            pdfPath,
-            newThumbnailPath.replace('.jpg', '')
-        ]);
-
-        let stderr = '';
-        pdftocairoProcess.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-
-        pdftocairoProcess.on('error', (error) => {
-            reject(new Error(`Failed to start pdftocairo process: ${error.message}`));
-        });
-
-        pdftocairoProcess.on('close', (code) => {
+        mutool.on('close', (code) => {
             if (code === 0) {
                 resolve();
             } else {
-                reject(new Error(`pdftocairo failed: ${stderr}`));
+                reject(new Error(`MuTool failed with code ${code}: ${stderr}`));
             }
         });
     });
 }
 
-// Moved to a separate utility function
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+function calculateRatio(originalSize, compressedSize) {
+    if (!originalSize || !compressedSize) return -1;
+    return parseFloat(((1 - compressedSize / originalSize) * 100).toFixed(1));
 }
 
-// Added error handling and input validation
-async function extractAndSaveMetadata(pdfPath, outputDir, isCompressed = false) {
-    try {
-        if (!pdfPath || !outputDir) {
-            throw new Error('PDF path and output directory are required');
-        }
+async function processBatch(pdfDoc, startPage, endPage, tempDir, outputDir) {
+    console.log(chalk.cyan(`\n📦 Processing batch: pages ${startPage}-${endPage}`));
+    
+    const batchResults = [];
 
-        const pdfBytes = await fs.readFile(pdfPath);
-        const pdfDoc = await PDFDocument.load(pdfBytes);
-        const stats = await fs.stat(pdfPath);
-        
-        const metadata = [
-            'PDF Document Metadata',
-            '===================\n',
-            'Basic Information',
-            '-----------------',
-            `Filename: ${path.basename(pdfPath)}`,
-            `File Size: ${formatBytes(stats.size)} (${stats.size.toLocaleString()} bytes)`,
-            `Number of Pages: ${pdfDoc.getPageCount()}`,
-            `Extracted At: ${new Date().toISOString()}`,
-            `Type: ${isCompressed ? 'Compressed Output' : 'Original Input'}\n`,
-            'Document Properties',
-            '------------------',
-            `Title: ${pdfDoc.getTitle() || 'Not specified'}`,
-            `Author: ${pdfDoc.getAuthor() || 'Not specified'}`,
-            `Subject: ${pdfDoc.getSubject() || 'Not specified'}`,
-            `Keywords: ${pdfDoc.getKeywords() || 'Not specified'}`,
-            `Creator: ${pdfDoc.getCreator() || 'Not specified'}`,
-            `Producer: ${pdfDoc.getProducer() || 'Not specified'}`,
-            `Creation Date: ${pdfDoc.getCreationDate()?.toISOString() || 'Not specified'}`,
-            `Last Modified: ${pdfDoc.getModificationDate()?.toISOString() || 'Not specified'}`
-        ].join('\n');
+    for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
+        const tempPdfDoc = await PDFDocument.create();
+        const [page] = await tempPdfDoc.copyPages(pdfDoc, [pageNum - 1]);
+        tempPdfDoc.addPage(page);
 
-        // Use different filenames for input and output metadata
-        const filename = isCompressed ? 'compressed_pdf_metadata.txt' : 'original_pdf_metadata.txt';
-        const metadataPath = path.join(outputDir, filename);
-        
-        await fs.writeFile(metadataPath, metadata);
-        return metadataPath;
-    } catch (error) {
-        throw new Error(`Failed to extract metadata: ${error.message}`);
+        // Save temporary page
+        const pagePath = path.join(tempDir, `page_${pageNum}_temp.pdf`);
+        await fs.writeFile(pagePath, await tempPdfDoc.save());
+        const originalSize = (await fs.stat(pagePath)).size;
+
+        // Single-line status with emojis and colors
+        process.stdout.write(
+            `📄 Page ${chalk.cyan(String(pageNum).padStart(2))}: ` +
+            `${chalk.gray(formatBytes(originalSize))} → `
+        );
+
+        const gsOutputPath = path.join(tempDir, `page_${pageNum}_gs.pdf`);
+        const mutoolOutputPath = path.join(tempDir, `page_${pageNum}_mutool.pdf`);
+
+        const results = await Promise.all([
+            compressWithMutool(pagePath, mutoolOutputPath).then(() => {
+                const size = statSync(mutoolOutputPath).size;
+                process.stdout.write(`${chalk.blue(formatBytes(size))} [MuTool] `);
+                return { tool: 'mutool', size, originalSize, pageNum, path: mutoolOutputPath };
+            }),
+            compressWithGs(pagePath, gsOutputPath).then(() => {
+                const size = statSync(gsOutputPath).size;
+                process.stdout.write(`${chalk.yellow(formatBytes(size))} [GS]`);
+                return { tool: 'gs', size, originalSize, pageNum, path: gsOutputPath };
+            })
+        ]);
+
+        const bestResult = results.reduce((best, current) => 
+            current.size < best.size ? current : best
+        );
+
+        // Show best result
+        const ratio = calculateRatio(originalSize, bestResult.size);
+        const ratioColor = ratio > 0 ? chalk.green : chalk.red;
+        console.log(` ✨ ${chalk.magenta(formatBytes(bestResult.size))} ` +
+                   `${ratioColor(`(${ratio > 0 ? '-' : ''}${Math.abs(ratio)}%)`)} ` +
+                   `using ${chalk.yellow(bestResult.tool)}`);
+
+        batchResults.push(bestResult);
+
+        // Save with proper padding in filename
+        const outputPath = path.join(outputDir, `page_${String(pageNum).padStart(5, '0')}.pdf`);
+        await fs.copyFile(bestResult.path, outputPath);
     }
+
+    return batchResults;
 }
 
-// Main function
 async function main() {
     const argv = yargs(hideBin(process.argv))
-        .option('no-merge', {
+        .option('merge', {
+            alias: 'm',
             type: 'boolean',
-            description: 'Do not create merged output file'
+            default: true,
+            description: 'Create merged output file'
         })
-        .option('no-pages', {
+        .option('pages', {
+            alias: 'p',
             type: 'boolean',
-            description: 'Do not keep individual page files'
+            default: true,
+            description: 'Keep individual pages'
         })
-        .option('no-metadata', {
+        .option('metadata', {
+            alias: 'd',
             type: 'boolean',
-            description: 'Do not create metadata file'
+            default: true,
+            description: 'Extract metadata'
         })
-        .option('no-thumbnails', {
+        .option('thumbnails', {
+            alias: 't',
             type: 'boolean',
-            description: 'Do not create page thumbnails'
+            default: true,
+            description: 'Generate thumbnails'
         })
         .option('batch-size', {
+            alias: 'b',
             type: 'number',
-            description: 'Number of pages to process in each batch',
-            default: BATCH_SIZE
+            default: 100,
+            description: 'Number of pages to process in each batch'
         })
+        .demandCommand(1)
+        .usage('Usage: $0 <input-pdf> [options]')
         .argv;
 
-    const options = {
-        ...DEFAULT_OPTIONS,
-        createMerged: !argv['no-merge'],
-        keepPages: !argv['no-pages'],
-        createMetadata: !argv['no-metadata'],
-        createThumbnails: !argv['no-thumbnails'],
-        batchSize: argv['batch-size']
+    const inputPath = argv._[0];
+    const outputDir = path.resolve('out');
+    const pagesDir = path.join(outputDir, 'pages');
+    const thumbnailsDir = path.join(outputDir, 'thumbnails');
+    const tempDir = path.join(outputDir, 'temp');
+
+    // Create directories
+    await Promise.all([
+        ensureDir(outputDir),
+        ensureDir(pagesDir),
+        ensureDir(thumbnailsDir),
+        ensureDir(tempDir)
+    ]);
+
+    // Initialize statistics
+    const stats = {
+        startTime: Date.now(),
+        totalOriginalSize: 0,
+        totalCompressedSize: 0,
+        toolCounts: {
+            gs: 0,
+            mutool: 0
+        }
     };
 
-    console.log(`Using batch size: ${options.batchSize}`);
-
-    try {
-        // Check for required executables
-        checkExecutable('gs');
-        checkExecutable('qpdf');
-        checkExecutable('mutool');
-        if (options.createThumbnails) {
-            checkExecutable('pdftocairo');
-        }
-
-        const inputFile = argv._[0];
-        if (!inputFile) {
-            throw new Error('Input file is required');
-        }
-
-        // Create output directories with new structure
-        const outDir = path.join(__dirname, 'out');
-        const tempDir = path.join(__dirname, 'temp_pages');
-        const pagesDir = path.join(outDir, 'pages');
-        const thumbnailsDir = path.join(outDir, 'thumbnails');
-
-        await ensureDir(outDir);
-        await ensureDir(tempDir);
-        await ensureDir(pagesDir);
-        await ensureDir(thumbnailsDir);
-
-        // Process the PDF
-        const pdfDoc = await PDFDocument.load(await fs.readFile(inputFile));
-        const totalPages = pdfDoc.getPageCount();
-        
-        console.log(`Processing ${totalPages} pages...`);
-
-        // Get the actual file size once at the start
-        const originalFileStats = await fs.stat(inputFile);
-        const actualOriginalSize = originalFileStats.size;
-
-        const stats = {
-            totalPages,
-            actualOriginalSize,  // Store the actual original file size
-            totalOriginalSize: 0,
-            totalCompressedSize: 0,
-            bestToolCounts: { gs: 0, qpdf: 0, mutool: 0, original: 0 },
-            startTime: Date.now()
-        };
-
-        // Process in batches
-        for (let i = 0; i < totalPages; i += options.batchSize) {
-            const batchStart = i + 1;
-            const batchEnd = Math.min(i + options.batchSize, totalPages);
-            console.log(`Processing batch from page ${batchStart} to ${batchEnd}`);
-            const batchStats = await processBatch(batchStart, batchEnd, pdfDoc, tempDir, pagesDir, options);
-            
-            // Aggregate statistics
-            stats.totalOriginalSize += batchStats.totalOriginalSize;
-            stats.totalCompressedSize += batchStats.totalCompressedSize;
-            Object.entries(batchStats.bestToolCounts).forEach(([tool, count]) => {
-                stats.bestToolCounts[tool] = (stats.bestToolCounts[tool] || 0) + count;
-            });
-        }
-
-        stats.processingTime = Date.now() - stats.startTime;
-
-        // Create metadata if requested
-        if (options.createMetadata) {
-            const inputMetadataPath = await extractAndSaveMetadata(inputFile, outDir, false);
-            console.log(`Original PDF metadata written to: ${inputMetadataPath}`);
-        }
-
-        // Merge if requested
-        if (options.createMerged) {
-            const originalName = path.basename(inputFile, '.pdf');
-            const outputFile = path.join(outDir, `${originalName}_compressed.pdf`);
-            
-            await mergePDFs(pagesDir, outputFile, inputFile);
-            
-            // Verify final file size
-            const finalStats = await fs.stat(outputFile);
-            const originalStats = await fs.stat(inputFile);
-            
-            if (finalStats.size >= originalStats.size) {
-                await fs.copyFile(inputFile, outputFile);
-                console.log('Warning: Final compression unsuccessful. Using original file.');
-            } else {
-                console.log(`Merged PDF saved to: ${outputFile}`);
-            }
-
-            if (options.createMetadata) {
-                const outputMetadataPath = await extractAndSaveMetadata(outputFile, outDir, true);
-                console.log(`Compressed PDF metadata written to: ${outputMetadataPath}`);
-            }
-        }
-
-        // Clean up temp directory
-        await fs.rm(tempDir, { recursive: true, force: true });
-
-        // Clean up pages if not keeping them
-        if (!options.keepPages) {
-            await fs.rm(pagesDir, { recursive: true, force: true });
-        }
-
-        console.log(chalk.bold.cyan('\n🎉 Compression Complete!'));
-        console.log(chalk.gray('═'.repeat(50)));
-
-        const totalSavings = ((1 - stats.totalCompressedSize / stats.actualOriginalSize) * 100).toFixed(1);
-        const savedBytes = stats.actualOriginalSize - stats.totalCompressedSize;
-        
-        console.log(`📄 Pages: ${chalk.green(stats.totalPages.toLocaleString())}`);
-        console.log(`💾 Size:  ${chalk.gray(formatBytes(stats.actualOriginalSize))} → ${chalk.green(formatBytes(stats.totalCompressedSize))}`);
-        console.log(`📉 Saved: ${chalk.green(formatBytes(savedBytes))} ${chalk.magenta(`(${totalSavings}%)`)}`);
-        console.log(`⏱️  Time:  ${chalk.yellow(formatTime(stats.processingTime / 1000))}`);
-
-        // Tool usage - more compact
-        console.log(chalk.bold.blue('\n🔧 Tools Used'));
-        console.log(chalk.gray('─'.repeat(50)));
-        Object.entries(stats.bestToolCounts)
-            .filter(([_, count]) => count > 0)
-            .forEach(([tool, count]) => {
-                const percentage = ((count / stats.totalPages) * 100).toFixed(1);
-                const emoji = {
-                    gs: '🚀',
-                    qpdf: '⚡',
-                    mutool: '🔨',
-                    original: '📄'
-                }[tool];
-                const bar = '█'.repeat(Math.floor(percentage / 5)).padEnd(20, '░');
-                console.log(`${emoji} ${chalk.yellow(tool.padEnd(8))} ${chalk.gray(bar)} ${chalk.green(count)} ${chalk.gray(`(${percentage}%)`)}`);
-            });
-
-        // After all processing is complete, add this before the final statistics
-        console.log(chalk.bold.cyan('\n📂 Output saved to:'));
-        console.log(chalk.yellow('./out/') + chalk.gray(' (compressed PDF, metadata, thumbnails)'));
-
-    } catch (error) {
-        console.error('An error occurred:', error);
-        process.exit(1);
+    // Extract original metadata
+    if (argv.metadata) {
+        console.log(chalk.cyan('\n📝 Extracting original metadata...'));
+        await extractMetadata(inputPath, path.join(outputDir, 'original_pdf_metadata.txt'));
     }
+
+    // Process pages
+    console.log(chalk.cyan('\n📄 Loading PDF...'));
+    const pdfBytes = await fs.readFile(inputPath);
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+    const pageCount = pdfDoc.getPageCount();
+    const batchSize = argv.batchSize;
+    const batches = Math.ceil(pageCount / batchSize);
+
+    console.log(chalk.cyan('\n🔍 Processing'), chalk.white(`${pageCount} pages...`));
+
+    const batchResults = [];
+    for (let i = 0; i < batches; i++) {
+        const startPage = i * batchSize + 1;
+        const endPage = Math.min((i + 1) * batchSize, pageCount);
+        const results = await processBatch(pdfDoc, startPage, endPage, tempDir, pagesDir);
+        batchResults.push(...results);
+    }
+
+    // Generate thumbnails
+    if (argv.thumbnails) {
+        console.log(chalk.cyan('\n🖼️  Generating thumbnails...'));
+        process.stdout.write('  '); // Initial indent
+        
+        for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+            const paddedNum = String(pageNum).padStart(5, '0');
+            const pagePath = path.join(pagesDir, `page_${paddedNum}.pdf`);
+            const thumbPath = path.join(thumbnailsDir, `page_${paddedNum}_thumb`);
+            
+            try {
+                await generateThumbnail(pagePath, thumbPath);
+                process.stdout.write(`${pageNum}${chalk.green('✓')} `);
+                
+                // Add line break every 10 pages for readability
+                if (pageNum % 10 === 0) {
+                    process.stdout.write('\n  ');
+                }
+            } catch (error) {
+                process.stdout.write(`${pageNum}${chalk.red('✗')} `);
+                console.error(chalk.red(`\nError: ${error.message}`));
+            }
+        }
+        console.log(); // Final newline
+    }
+
+    // Merge compressed pages
+    if (argv.merge) {
+        console.log(chalk.cyan('\n📚 Merging compressed pages...'));
+        const mergedPdfDoc = await PDFDocument.create();
+        
+        for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+            const paddedNum = String(pageNum).padStart(5, '0');
+            const pagePath = path.join(pagesDir, `page_${paddedNum}.pdf`);
+            const pageBytes = await fs.readFile(pagePath);
+            const [page] = await mergedPdfDoc.copyPages(await PDFDocument.load(pageBytes), [0]);
+            mergedPdfDoc.addPage(page);
+        }
+
+        const outputPath = path.join(outputDir, path.basename(inputPath, '.pdf') + '_compressed.pdf');
+        await fs.writeFile(outputPath, await mergedPdfDoc.save());
+        
+    }
+
+    // Show summary
+    const totalTime = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+    const totalRatio = calculateRatio(stats.totalOriginalSize, stats.totalCompressedSize);
+    const ratioDisplay = totalRatio > 0 
+        ? `-${Math.abs(totalRatio)}%`  // For positive ratio (size reduction)
+        : `+${Math.abs(totalRatio)}%`; // For negative ratio (size increase)
+    
+    console.log(
+        `📊 Summary: ${chalk.cyan(pageCount)} pages | ` +
+        `${chalk.gray(formatBytes(stats.totalOriginalSize))} → ` +
+        `${chalk.magenta(formatBytes(stats.totalCompressedSize))} ` +
+        `${chalk.green(`(${ratioDisplay})`)} | ` +
+        `${chalk.yellow(`${totalTime}s`)}`
+    );
+
+    // Cleanup
+    await fs.rm(tempDir, { recursive: true, force: true });
+    
+    console.log(chalk.green('\n✅ Compression complete!'));
+    console.log(chalk.gray(`Output saved in: ${outputDir}`));
 }
 
-// Run the main function
-if (require.main === module) {
-    main().catch(error => {
-        console.error('Fatal error:', error);
-        process.exit(1);
-    });
-}
+main().catch(err => {
+    console.error(chalk.red(`Error: ${err.message}`));
+    process.exit(1);
+});
 
-module.exports = {
-    compressPage,
-    optimizeWithQpdf,
-    optimizeWithMutool,
-    formatBytes,
-    formatTime,
-    mergePDFs,
-    processBatch
-};
+function createProgressBar(total) {
+    const width = 30;
+    let current = 0;
+    
+    return {
+        update: (value) => {
+            current = value;
+            const percentage = Math.round((current / total) * 100);
+            const filled = Math.round((width * current) / total);
+            const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+            
+            process.stdout.write(`\r  ${bar} ${percentage}% | Page ${current}/${total}`);
+        },
+        done: () => {
+            process.stdout.write('\n');
+        }
+    };
+}

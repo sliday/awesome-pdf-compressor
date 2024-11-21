@@ -3,7 +3,7 @@
 Aggressive PDF compression with thumbnail generation, metadata extraction, and multi-tool optimization.
 
 ## Features
-- Multi-tool PDF compression (Ghostscript, qpdf, mutool)
+- Multi-tool PDF compression (Ghostscript and mutool)
 - 200px thumbnail generation (pdftocairo)
 - Metadata preservation and extraction
 - Parallel processing with batch support
@@ -13,13 +13,13 @@ Aggressive PDF compression with thumbnail generation, metadata extraction, and m
 ## Prerequisites
 ```bash
 # Ubuntu/Debian
-sudo apt-get install ghostscript qpdf mupdf-tools poppler-utils
+sudo apt-get install ghostscript mupdf-tools poppler-utils
 
 # macOS
-brew install ghostscript qpdf mupdf-tools poppler
+brew install ghostscript mupdf-tools poppler
 
 # Windows (Chocolatey)
-choco install ghostscript qpdf mupdf poppler
+choco install ghostscript mupdf poppler
 ```
 
 ## Usage
