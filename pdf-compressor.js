@@ -1,11 +1,11 @@
 const { spawn } = require('child_process');
 const { execSync } = require('child_process');
 const fs = require('fs').promises;
-const fsSync = require('fs');
 const path = require('path');
 const { PDFDocument } = require('pdf-lib');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
+const chalk = require('chalk');
 
 // Constants
 const CONCURRENT_TASKS = 2;
@@ -66,6 +66,8 @@ async function processBatch(startPage, endPage, pdfDoc, tempDir, outputDir, opti
 
     for (let i = startPage; i <= endPage && i <= pdfDoc.getPageCount(); i++) {
         const pageNum = i;
+        process.stdout.write(chalk.gray(`\r⚡ Processing page ${chalk.white(pageNum)}/${endPage}...`));
+        
         const tempPdfDoc = await PDFDocument.create();
         const [page] = await tempPdfDoc.copyPages(pdfDoc, [pageNum - 1]);
         tempPdfDoc.addPage(page);
@@ -97,16 +99,31 @@ async function processBatch(startPage, endPage, pdfDoc, tempDir, outputDir, opti
     }
 
     // Log batch compression statistics
-    console.log('\nBatch Compression Statistics:');
-    console.log(`Original size: ${formatBytes(batchStats.totalOriginalSize)}`);
-    console.log(`Compressed size: ${formatBytes(batchStats.totalCompressedSize)}`);
-    console.log(`Compression ratio: ${((1 - batchStats.totalCompressedSize / batchStats.totalOriginalSize) * 100).toFixed(1)}%`);
-    console.log('\nBest compression by tool:');
+    console.log(chalk.cyan('\n📊 Batch Compression Statistics'));
+    console.log('━'.repeat(50));
+    console.log(`📥 Original size:     ${chalk.yellow(formatBytes(batchStats.totalOriginalSize))}`);
+    console.log(`📤 Compressed size:   ${chalk.green(formatBytes(batchStats.totalCompressedSize))}`);
+    console.log(`📉 Compression ratio: ${chalk.magenta(((1 - batchStats.totalCompressedSize / batchStats.totalOriginalSize) * 100).toFixed(1))}%`);
+    
+    console.log(chalk.cyan('\n🔧 Best compression by tool'));
+    console.log('━'.repeat(50));
     Object.entries(batchStats.bestToolCounts)
         .filter(([_, count]) => count > 0)
         .forEach(([tool, count]) => {
-            console.log(`${tool}: ${count} pages`);
+            const emoji = {
+                gs: '🚀',
+                qpdf: '⚡',
+                mutool: '🔨',
+                original: '📄'
+            }[tool] || '•';
+            console.log(`${emoji} ${chalk.yellow(tool.padEnd(8))}: ${chalk.green(count)} pages`);
         });
+
+    // Batch summary - simplified and more visual
+    console.log(chalk.bold.blue('\n📦 Batch Summary'));
+    console.log(chalk.gray('─'.repeat(50)));
+    const savings = ((1 - batchStats.totalCompressedSize / batchStats.totalOriginalSize) * 100).toFixed(1);
+    console.log(`${chalk.gray(formatBytes(batchStats.totalOriginalSize))} → ${chalk.green(formatBytes(batchStats.totalCompressedSize))} ${chalk.magenta(`(-${savings}%)`)}\n`);
 
     return batchStats;
 }
@@ -657,13 +674,37 @@ async function main() {
             await fs.rm(pagesDir, { recursive: true, force: true });
         }
 
-        console.log('\nCompression Summary:');
-        console.log(`Total pages processed: ${stats.totalPages}`);
-        console.log(`Original size: ${formatBytes(stats.actualOriginalSize)}`);  // Use actual original size
-        console.log(`Compressed size: ${formatBytes(stats.totalCompressedSize)}`);
-        console.log(`Compression ratio: ${((1 - stats.totalCompressedSize / stats.actualOriginalSize) * 100).toFixed(1)}%`);
-        console.log(`Total processing time: ${formatTime(stats.processingTime / 1000)}`);
-        console.log(`Average time per page: ${formatTime((stats.processingTime / 1000) / stats.totalPages)}`);
+        console.log(chalk.bold.cyan('\n🎉 Compression Complete!'));
+        console.log(chalk.gray('═'.repeat(50)));
+
+        const totalSavings = ((1 - stats.totalCompressedSize / stats.actualOriginalSize) * 100).toFixed(1);
+        const savedBytes = stats.actualOriginalSize - stats.totalCompressedSize;
+        
+        console.log(`📄 Pages: ${chalk.green(stats.totalPages.toLocaleString())}`);
+        console.log(`💾 Size:  ${chalk.gray(formatBytes(stats.actualOriginalSize))} → ${chalk.green(formatBytes(stats.totalCompressedSize))}`);
+        console.log(`📉 Saved: ${chalk.green(formatBytes(savedBytes))} ${chalk.magenta(`(${totalSavings}%)`)}`);
+        console.log(`⏱️  Time:  ${chalk.yellow(formatTime(stats.processingTime / 1000))}`);
+
+        // Tool usage - more compact
+        console.log(chalk.bold.blue('\n🔧 Tools Used'));
+        console.log(chalk.gray('─'.repeat(50)));
+        Object.entries(stats.bestToolCounts)
+            .filter(([_, count]) => count > 0)
+            .forEach(([tool, count]) => {
+                const percentage = ((count / stats.totalPages) * 100).toFixed(1);
+                const emoji = {
+                    gs: '🚀',
+                    qpdf: '⚡',
+                    mutool: '🔨',
+                    original: '📄'
+                }[tool];
+                const bar = '█'.repeat(Math.floor(percentage / 5)).padEnd(20, '░');
+                console.log(`${emoji} ${chalk.yellow(tool.padEnd(8))} ${chalk.gray(bar)} ${chalk.green(count)} ${chalk.gray(`(${percentage}%)`)}`);
+            });
+
+        // After all processing is complete, add this before the final statistics
+        console.log(chalk.bold.cyan('\n📂 Output saved to:'));
+        console.log(chalk.yellow('./out/') + chalk.gray(' (compressed PDF, metadata, thumbnails)'));
 
     } catch (error) {
         console.error('An error occurred:', error);
