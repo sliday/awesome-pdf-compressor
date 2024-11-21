@@ -35,6 +35,7 @@ node pdf-compressor.js <input.pdf> [options]
 | `--no-pages` | Skip individual pages | Keeps pages |
 | `--no-metadata` | Skip metadata extraction | Creates metadata |
 | `--no-thumbnails` | Skip thumbnails | Creates thumbnails |
+| `--batch-size` | Number of pages to process in each batch | 100 |
 
 ### Examples
 ```bash
@@ -46,6 +47,9 @@ node pdf-compressor.js input.pdf --no-merge
 
 # Only merged output
 node pdf-compressor.js input.pdf --no-pages --no-thumbnails --no-metadata
+
+# Custom batch size
+node pdf-compressor.js input.pdf --batch-size 50
 ```
 
 ### Output Structure
@@ -67,14 +71,14 @@ node pdf-compressor.js input.pdf --no-pages --no-thumbnails --no-metadata
 ## Configuration
 ```javascript
 const CONCURRENT_TASKS = 2;    // Parallel processes
-const BATCH_SIZE = 100;        // Pages per batch
+const BATCH_SIZE = 100;        // Default pages per batch
 const THUMBNAIL_WIDTH = 200;   // Thumbnail width in pixels
 ```
 
 ## Memory Tips
 - Use `--no-merge` for large PDFs
 - Use `--no-thumbnails` for faster processing
-- Adjust `BATCH_SIZE` for memory optimization
+- Adjust `--batch-size` for memory optimization (lower values use less memory)
 - All output files are organized in the `out` directory
 
 ## Dependencies

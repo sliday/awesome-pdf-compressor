@@ -138,12 +138,9 @@ async function compressPage(inputPath, outputPath, pageNum) {
             '-dDownsampleColorImages=true',
             '-dDownsampleGrayImages=true',
             '-dDownsampleMonoImages=true',
-            '-dColorImageResolution=100',
-            '-dGrayImageResolution=100',
-            '-dMonoImageResolution=100',
-            '-dColorImageDownsampleType=/Average',
-            '-dGrayImageDownsampleType=/Average',
-            '-dMonoImageDownsampleType=/Subsample',
+            '-dColorImageResolution=96',
+            '-dGrayImageResolution=96',
+            '-dMonoImageResolution=96',
             
             // Maximum image compression
             '-dAutoFilterColorImages=true',
@@ -396,7 +393,7 @@ async function optimizeWithMutool(inputFile, outputFile) {
 }
 
 // Function to merge PDF pages
-async function mergePDFs(inputDir, outputFile) {
+async function mergePDFs(inputDir, outputFile, originalInputFile) {
     const mergedPdf = await PDFDocument.create();
     
     // Get all PDF files in the directory
@@ -417,9 +414,24 @@ async function mergePDFs(inputDir, outputFile) {
         pages.forEach(page => mergedPdf.addPage(page));
     }
 
-    // Save the merged PDF
-    const mergedPdfBytes = await mergedPdf.save();
-    await fs.writeFile(outputFile, mergedPdfBytes);
+    const mergedPdfBytes = await mergedPdf.save({
+        useObjectStreams: true,
+        addDefaultPage: false,
+        objectsStack: 50,
+        compress: true
+    });
+
+    // Compare with original file size
+    const originalStats = await fs.stat(originalInputFile);
+    const originalSize = originalStats.size;
+    
+    if (mergedPdfBytes.length < originalSize) {
+        await fs.writeFile(outputFile, mergedPdfBytes);
+    } else {
+        // If merged file is larger, use the original
+        await fs.copyFile(originalInputFile, outputFile);
+        console.log('Warning: Compressed version was larger than original. Using original file.');
+    }
 }
 
 // Function to generate thumbnail
@@ -528,6 +540,11 @@ async function main() {
             type: 'boolean',
             description: 'Do not create page thumbnails'
         })
+        .option('batch-size', {
+            type: 'number',
+            description: 'Number of pages to process in each batch',
+            default: BATCH_SIZE
+        })
         .argv;
 
     const options = {
@@ -535,8 +552,11 @@ async function main() {
         createMerged: !argv['no-merge'],
         keepPages: !argv['no-pages'],
         createMetadata: !argv['no-metadata'],
-        createThumbnails: !argv['no-thumbnails']
+        createThumbnails: !argv['no-thumbnails'],
+        batchSize: argv['batch-size']
     };
+
+    console.log(`Using batch size: ${options.batchSize}`);
 
     try {
         // Check for required executables
@@ -583,9 +603,10 @@ async function main() {
         };
 
         // Process in batches
-        for (let i = 0; i < totalPages; i += BATCH_SIZE) {
+        for (let i = 0; i < totalPages; i += options.batchSize) {
             const batchStart = i + 1;
-            const batchEnd = Math.min(i + BATCH_SIZE, totalPages);
+            const batchEnd = Math.min(i + options.batchSize, totalPages);
+            console.log(`Processing batch from page ${batchStart} to ${batchEnd}`);
             const batchStats = await processBatch(batchStart, batchEnd, pdfDoc, tempDir, pagesDir, options);
             
             // Aggregate statistics
@@ -609,8 +630,18 @@ async function main() {
             const originalName = path.basename(inputFile, '.pdf');
             const outputFile = path.join(outDir, `${originalName}_compressed.pdf`);
             
-            await mergePDFs(pagesDir, outputFile);
-            console.log(`Merged PDF saved to: ${outputFile}`);
+            await mergePDFs(pagesDir, outputFile, inputFile);
+            
+            // Verify final file size
+            const finalStats = await fs.stat(outputFile);
+            const originalStats = await fs.stat(inputFile);
+            
+            if (finalStats.size >= originalStats.size) {
+                await fs.copyFile(inputFile, outputFile);
+                console.log('Warning: Final compression unsuccessful. Using original file.');
+            } else {
+                console.log(`Merged PDF saved to: ${outputFile}`);
+            }
 
             if (options.createMetadata) {
                 const outputMetadataPath = await extractAndSaveMetadata(outputFile, outDir, true);
