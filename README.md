@@ -2,6 +2,8 @@
 
 Aggressive PDF compression with thumbnail generation, metadata extraction, and multi-tool optimization.
 
+![CleanShot 2024-11-21 at 22 24 23@2x](https://github.com/user-attachments/assets/895d31f2-61d4-4a25-81a1-6f31a739ef89)
+
 ## Features
 - Multi-tool PDF compression (Ghostscript and mutool)
 - 200px thumbnail generation (pdftocairo)
